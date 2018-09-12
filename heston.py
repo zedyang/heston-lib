@@ -49,6 +49,19 @@ def make_surface(func, x, y):
     return xx, yy, zz
 
 
+def perturb_surface(iv_func, K_knots, T_knots, bump_point, rotation):
+    surface_knots = []
+    Kc, Tc = bump_point
+    for i, K in enumerate(K_knots):
+        for j, T in enumerate(T_knots):
+            knot = {'strike': K, 'mat': T, 'iv': iv_func(K, T)}
+            if K == Kc and T == Tc:
+                knot['iv'] += 0.01
+            knot['iv'] += rotation.get((K, T), 0)
+            surface_knots.append(knot)
+    return pd.DataFrame(surface_knots)
+
+
 class UnivariateHestonSV(object):
 
     def __init__(self, asset_identifier):
@@ -153,6 +166,19 @@ class UnivariateHestonSV(object):
 
         return _p
 
+    def make_perturbed_surface_knots(self, S0, K_knots, T_knots,
+                                     bump_point, rotation):
+        iv_func = self.make_iv_surface_function(S0)
+        surface_knots = perturb_surface(
+            iv_func, K_knots, T_knots, bump_point, rotation)
+        surface_knots['corp'] = self.asset_idx
+
+        def _bs_px(row):
+            return bs_call_px(
+                S0, row['strike'], row['mat'], self.r, row['iv'])
+        surface_knots['bs_px'] = surface_knots.apply(_bs_px, axis=1)
+        return surface_knots
+
 
 class MultivariateHestonSV(object):
 
@@ -217,6 +243,19 @@ class MultivariateHestonSV(object):
         for i, a in enumerate(self.assets):
             funcs[a] = self.univariates[a].make_pricing_function()
         return funcs
+
+    def make_perturbed_surface_knots(self, S0, knots, bump_points, rotations):
+        assert self.calibrated
+        data = []
+        bar = ProgressBar()
+        for i, a in bar(list(enumerate(self.assets))):
+            K_knots, T_knots = knots[i]
+            surface_knots = self.univariates[a].make_perturbed_surface_knots(
+                S0[i], K_knots, T_knots, bump_points[i], rotations[i])
+            data.append(surface_knots)
+        all_data = pd.DataFrame(pd.concat(data, axis=0))
+        all_data = all_data.reset_index(drop=True)
+        return all_data
 
     @staticmethod
     @nb.jit(nb.types.UniTuple(nb.float64[:, :], 3)(
@@ -301,6 +340,53 @@ class MultivariateHestonSV(object):
         S_bwd = np.exp(X_bwd)
         return S_central, S_fwd, S_bwd, X_central, X_fwd, X_bwd,  V
 
+    @staticmethod
+    @nb.jit(nb.types.UniTuple(nb.float64[:, :], 7)(
+        nb.int64, nb.int64, nb.float64, nb.float64, nb.float64[:],
+        nb.float64[:, :], nb.float64[:, :], nb.float64[:, :],
+        nb.float64[:, :], nb.float64[:, :], nb.float64[:, :]))
+    def simulate_1path_cfb_given_dW(n_nodes, n_assets, T, dS, S0,
+                                    r_vec, kappa_vec, v0_vec,
+                                    theta_vec, eta_vec, dW):
+        dt = T / n_nodes
+        dW_v = dW[:, :n_assets]
+        dW_X = dW[:, n_assets:]
+
+        # containers
+        V = np.zeros((n_nodes, n_assets))
+        X_central = np.zeros((n_nodes, n_assets))  # X_t = log (S_t)
+        X_fwd = np.zeros((n_nodes, n_assets, n_assets))
+        # X_fwd[t, i, j] = log (S_it | S_j0 + dS_j0)
+        X_bwd = np.zeros((n_nodes, n_assets, n_assets))
+
+        V[0, :], X_central[0, :] = v0_vec, np.log(S0)
+        S0_matrix = np.repeat(S0.reshape(n_assets, 1), n_assets, axis=1)
+        X_fwd[0, :, :] = np.log(S0_matrix + np.diag(np.repeat(dS, n_assets)))
+        X_bwd[0, :, :] = np.log(S0_matrix - np.diag(np.repeat(dS, n_assets)))
+
+        # simulate heston process
+        for t in range(1, n_nodes):
+            # V[t,:] -> (1*n_assets) row vector
+            # V_{t+1} = V_t + k(theta - V_t^+)dt + eta*\sqrt{dt V_t^+} dW_v
+            V[t, :] = V[t - 1, :] + kappa_vec * (
+                theta_vec - V[t - 1, :].clip(0)) * dt + eta_vec * (
+                np.sqrt(V[t - 1, :].clip(0) * dt)) * dW_v[t - 1, :]
+            # S_{t+1} = S_t + (r-.5 V_t^+)dt + \sqrt{dt V_t^+} dW_S
+            X_central[t, :] = X_central[t - 1, :] + \
+                (r_vec - .5 * V[t - 1, :].clip(0)) * dt + \
+                (np.sqrt(V[t - 1, :].clip(0) * dt)) * dW_X[t - 1, :]
+            for X in [X_bwd, X_fwd]:
+                for j in range(n_assets):
+                    # new process with respect to (S_0j +- dS_0j)
+                    X[t, :, j] = X[t - 1, :, j] + \
+                        (r_vec - .5 * V[t - 1, :].clip(0)) * dt + \
+                        (np.sqrt(V[t - 1, :].clip(0) * dt)) * dW_X[t - 1, :]
+
+        S_central = np.exp(X_central)
+        S_fwd = np.exp(X_fwd)
+        S_bwd = np.exp(X_bwd)
+        return S_central, S_fwd, S_bwd, X_central, X_fwd, X_bwd,  V
+
     @nb.jit
     def simulate_paths(self, n_paths, n_nodes, T, S0):
         SS = np.zeros((n_nodes, n_paths, self.n_assets))
@@ -331,6 +417,27 @@ class MultivariateHestonSV(object):
                     n_nodes, self.n_assets, T, dS, S0,
                     self.r_vec, self.kappa_vec, self.v0_vec, self.theta_vec,
                     self.eta_vec, self.cov)
+            SSc[:, i, :], XXc[:, i, :], VV[:, i, :] = Sc, Xc, V
+            SSf[:, i, :, :], XXf[:, i, :, :] = Sf, Xf
+            SSb[:, i, :, :], XXb[:, i, :, :] = Sb, Xb
+        return SSc, SSf, SSb, XXc, XXf, XXb, VV
+
+    @nb.jit
+    def simulate_paths_cfb_given_dW(self, n_paths, n_nodes, T, dS, S0, dWs):
+        SSc = np.zeros((n_nodes, n_paths, self.n_assets))
+        SSf = np.zeros((n_nodes, n_paths, self.n_assets, self.n_assets))
+        SSb = np.zeros((n_nodes, n_paths, self.n_assets, self.n_assets))
+        XXc = np.zeros((n_nodes, n_paths, self.n_assets))
+        XXf = np.zeros((n_nodes, n_paths, self.n_assets, self.n_assets))
+        XXb = np.zeros((n_nodes, n_paths, self.n_assets, self.n_assets))
+        VV = np.zeros((n_nodes, n_paths, self.n_assets))
+        bar = ProgressBar()
+        for i in bar(list(range(n_paths))):
+            Sc, Sf, Sb, Xc, Xf, Xb, V = \
+                MultivariateHestonSV.simulate_1path_cfb_given_dW(
+                    n_nodes, self.n_assets, T, dS, S0,
+                    self.r_vec, self.kappa_vec, self.v0_vec, self.theta_vec,
+                    self.eta_vec, dWs[:, i, :])
             SSc[:, i, :], XXc[:, i, :], VV[:, i, :] = Sc, Xc, V
             SSf[:, i, :, :], XXf[:, i, :, :] = Sf, Xf
             SSb[:, i, :, :], XXb[:, i, :, :] = Sb, Xb
@@ -631,6 +738,102 @@ class MultiAssetsWorstOfDiscreteKIEuropeanPut(MultiAssetsOption):
         return (Ks - S_terminal).clip(0) * (S_min < Hs) * x
 
 
+class MultiAssetsBestOfDiscreteKIEuropeanPut(MultiAssetsOption):
+    def __init__(self, multivariate_model, collars, best_of_call, spots,
+                 T_entry, T_mature, Ds, Ks=None, Hs=None, verbose=2,
+                 monitor_freq=252, n_paths=5000, pre_computed_paths=None,
+                 premium=0.0):
+        super(MultiAssetsBestOfDiscreteKIEuropeanPut, self).__init__(
+            multivariate_model, None, T_mature)
+        self.premium = premium
+        self.Ds = Ds
+        self.Ks = Ks
+        self.Hs = Hs
+        self.S_init = spots
+        self.T_mature = T_mature
+        self.T_entry = T_entry
+        self.collars = collars
+        self.best_of_call = best_of_call
+        self.force_monitor_freq = monitor_freq
+        self.force_disc_factor_dim = 1
+
+        if Ks is not None:
+            return
+        if verbose:
+            print('Solving barriers...')
+        self.boc_px, _, paths = self.best_of_call.mc_price(
+            spots, n_paths, monitor_freq, return_paths=True,
+            pre_computed_paths=pre_computed_paths)
+        disc_factor = np.exp(-self.model.r_vec[0, 0] * self.T)
+
+        def _err_func(_Ks):
+            # make a different payoff function for every K
+            def _boKIPut_payoff(_paths):
+
+                SS, XX, VV = _paths
+                n_t, n, n_a = SS.shape
+                _idx_entry = int(n_t / self.T_mature) * self.T_entry - 1
+                _S_entry = SS[_idx_entry, :, :]
+                _ret = (_S_entry - self.S_init) / self.S_init
+                _best_idx = np.argmax(_ret, axis=1)
+                _best_ret = np.max(_ret, axis=1)
+                _S_min = np.min(
+                    SS[_idx_entry:, :, :], axis=0)[range(n), _best_idx]
+                __Ks = np.vstack([_Ks] * n)[
+                    range(n), _best_idx]
+                __Hs = np.vstack([_Ks-self.Ds] * n)[
+                    range(n), _best_idx]
+                _x = np.vstack([self.collars.shares] * n)[
+                    range(n), _best_idx]
+                _S_terminal = SS[-1, range(n), _best_idx]
+                return (__Ks - _S_terminal).clip(0) * (_S_min < __Hs) * (
+                    _best_ret >= self.best_of_call.required_ret) * _x
+
+            # use same paths
+            KI_px, _ = MultiAssetsOption.mc_price_custom_payoff(
+                paths, disc_factor, _boKIPut_payoff)
+            return (self.boc_px - KI_px) + premium
+
+        fit_res = least_squares(
+            _err_func, x0=self.collars.put_Ks,
+            bounds=(
+                np.zeros(self.n_assets),
+                self.collars.call_Ks
+            ),
+            ftol=1e-5, verbose=verbose,
+        )
+        if hasattr(fit_res, 'x'):
+            self.Ks = fit_res.x
+            self.Hs = self.Ks - self.Ds
+        self.err_func = _err_func
+
+    def __repr__(self):
+        return f'MultiAssetsBestOfDiscreteKIEuropeanPut: ' \
+               + f'K={str3f_vector(self.Ks)}, ' \
+               + f'H={str3f_vector(self.Hs)}, ' \
+               + f'T_entry={self.T_entry}, T_mature={self.T_mature}'
+
+    def payoff(self, paths):
+        SS, XX, VV = paths
+        n_t, n_paths, n_a = SS.shape
+        idx_entry = int(n_t / self.T_mature) * self.T_entry - 1
+        S_entry = SS[idx_entry, :, :]
+        ret = (S_entry - self.S_init) / self.S_init
+        best_idx = np.argmax(ret, axis=1)
+        best_ret = np.max(ret, axis=1)
+        S_min = np.min(
+            SS[idx_entry:, :, :], axis=0)[range(n_paths), best_idx]
+        Ks = np.vstack([self.Ks] * n_paths)[
+            range(n_paths), best_idx]
+        Hs = np.vstack([self.Hs] * n_paths)[
+            range(n_paths), best_idx]
+        x = np.vstack([self.collars.shares] * n_paths)[
+            range(n_paths), best_idx]
+        S_terminal = SS[-1, range(n_paths), best_idx]
+        return (Ks - S_terminal).clip(0) * (S_min < Hs) * (
+            best_ret >= self.best_of_call.required_ret) * x
+
+
 class MultiAssetsBestOfAsianCall(MultiAssetsOption):
     def __init__(self, multivariate_model, collars,
                  T_entry, T_mature, S_init, required_return):
@@ -869,6 +1072,60 @@ def structure_constructor(model, x, put_Ks, Ds, R_req,
     return loss, structure, pct_adv, cap_locked_in, deltas, px_slippage
 
 
+def structure_constructor_best_KI(model, x, put_Ks, Ds, R_req,
+                                  adv, adv_thres, S0, cap_required, alpha,
+                                  pre_computed_paths, premiums, dS=1e-4):
+    SSc, SSf, SSb, XXc, XXf, XXb, VV = pre_computed_paths
+    paths_c = (SSc, XXc, VV)
+    # paths_f = (SSf, XXf, VV)
+    # paths_b = (SSb, XXb, VV)
+    n_nodes, n_paths, n_assets = SSc.shape
+    disc_factor = np.exp(-0.045 * 2)
+    vol_0 = np.sqrt(model.v0_vec)
+    premium_collar, premium_KI = premiums
+    # construct portfolio
+    zero_collar = MultiAssetsAsianZeroCostCollar(
+        model, spots=S0, x=np.abs(x),
+        put_Ks=put_Ks, T=2,
+        n_paths=n_paths, n_nodes_per_year=252,
+        premium=premium_collar,
+        pre_computed_paths=paths_c, verbose=0
+    )
+    best_of_call = MultiAssetsBestOfAsianCall(
+        model, zero_collar,
+        T_entry=1, T_mature=2,
+        S_init=S0, required_return=R_req
+    )
+    best_of_KI_put = MultiAssetsBestOfDiscreteKIEuropeanPut(
+        model, zero_collar, best_of_call, S0, Ds=Ds,
+        T_entry=1, T_mature=2, n_paths=n_paths,
+        premium=premium_KI,
+        pre_computed_paths=paths_c, verbose=0
+    )
+    structure = {
+        'Zero Collar': zero_collar,
+        'Best of Call': best_of_call,
+        'Best of KI Put': best_of_KI_put
+    }
+    # calculate initial delta
+    delta_collar = zero_collar.mc_delta(
+        spots=S0, dS=dS, pre_computed_paths=pre_computed_paths)
+    delta_boc = best_of_call.mc_delta(
+        spots=S0, dS=dS, pre_computed_paths=pre_computed_paths)
+    delta_KI = best_of_KI_put.mc_delta(
+        spots=S0, dS=dS, pre_computed_paths=pre_computed_paths)
+    delta_collar = np.diag(delta_collar).reshape(1, n_assets)*x
+    delta_total = (delta_collar - delta_boc + delta_KI)
+    pct_adv = delta_total / adv
+    pct_adv_above = (pct_adv - adv_thres).clip(0)
+    px_slippage = slippage_sq_root(vol_0, delta_total, adv, S0)
+    cap_locked_in = np.sum(-put_Ks * x) * disc_factor
+    loss = np.linalg.norm(pct_adv_above, 2) + alpha * (
+        cap_required-cap_locked_in).clip(0)
+    deltas = [delta_collar, delta_boc, delta_KI]
+    return loss, structure, pct_adv, cap_locked_in, deltas, px_slippage
+
+
 def structure_constructor_best_eu(model, x, put_Ks, Ds, R_req,
                                   adv, adv_thres, S0, cap_required, alpha,
                                   pre_computed_paths, premiums, dS=1e-4):
@@ -921,3 +1178,38 @@ def structure_constructor_best_eu(model, x, put_Ks, Ds, R_req,
         cap_required-cap_locked_in).clip(0)
     deltas = [delta_collar, delta_boc, delta_KI]
     return loss, structure, pct_adv, cap_locked_in, deltas, px_slippage
+
+
+def structure_evaluator(model, struct, adv, adv_thres, S0, cap_required,
+                        pre_computed_paths, dS=1e-4, alpha=0.1):
+    SSc, SSf, SSb, XXc, XXf, XXb, VV = pre_computed_paths
+    paths_c = (SSc, XXc, VV)
+    # paths_f = (SSf, XXf, VV)
+    # paths_b = (SSb, XXb, VV)
+    n_nodes, n_paths, n_assets = SSc.shape
+    disc_factor = np.exp(-0.045 * 2)
+    vol_0 = np.sqrt(model.v0_vec)
+
+    zero_collar = struct['Zero Collar']
+    best_of_call = struct['Best of Call']
+    worst_of_KI_put = struct['worst of KI Put']
+    put_Ks = zero_collar.put_Ks
+    x = zero_collar.x
+
+    # calculate initial delta
+    delta_collar = zero_collar.mc_delta(
+        spots=S0, dS=dS, pre_computed_paths=pre_computed_paths)
+    delta_boc = best_of_call.mc_delta(
+        spots=S0, dS=dS, pre_computed_paths=pre_computed_paths)
+    delta_KI = worst_of_KI_put.mc_delta(
+        spots=S0, dS=dS, pre_computed_paths=pre_computed_paths)
+    delta_collar = np.diag(delta_collar).reshape(1, n_assets)*x
+    delta_total = (delta_collar - delta_boc + delta_KI)
+    pct_adv = delta_total / adv
+    pct_adv_above = (pct_adv - adv_thres).clip(0)
+    px_slippage = slippage_sq_root(vol_0, delta_total, adv, S0)
+    cap_locked_in = np.sum(-put_Ks * x) * disc_factor
+    loss = np.linalg.norm(pct_adv_above, 2) + alpha * (
+        cap_required-cap_locked_in).clip(0)
+    deltas = [delta_collar, delta_boc, delta_KI]
+    return loss, struct, pct_adv, cap_locked_in, deltas, px_slippage
